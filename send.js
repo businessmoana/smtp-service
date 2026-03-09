@@ -14,7 +14,7 @@ import 'dotenv/config';
 import nodemailer from 'nodemailer';
 import dns from 'dns';
 import { promisify } from 'util';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -23,7 +23,18 @@ const resolve4 = promisify(dns.resolve4);
 
 const FROM_EMAIL = 'businessmoana118@gmail.com';
 const EMAILS_FILE = join(__dirname, 'emails_merged.txt');
+const RESULTS_FILE = join(__dirname, 'send_results.json');
 const GMAIL_SMTP_HOST = 'smtp.gmail.com';
+
+/** Delay between sends (ms) to reduce Gmail "too many login attempts" rate limit. */
+function getDelayMs() {
+  const env = process.env.DELAY_MS;
+  if (env != null && env !== '') {
+    const n = parseInt(env, 10);
+    if (!Number.isNaN(n) && n >= 0) return n;
+  }
+  return 2000;
+}
 
 // Load recipients from file (comma-separated on one or more lines)
 function loadEmails() {
@@ -33,6 +44,27 @@ function loadEmails() {
     .map((e) => e.trim().toLowerCase())
     .filter((e) => e && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
   return [...new Set(emails)];
+}
+
+/** Load result file: { [email]: { status: 'sent'|'failed', at: ISO date, error?: string } } */
+function loadResults() {
+  if (!existsSync(RESULTS_FILE)) return {};
+  try {
+    const raw = readFileSync(RESULTS_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+/** Append one result and write back so restart won't re-send. */
+function saveResult(results, email, status, errorMessage = null) {
+  results[email] = {
+    status,
+    at: new Date().toISOString(),
+    ...(errorMessage != null ? { error: errorMessage } : {}),
+  };
+  writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2), 'utf8');
 }
 
 /** Resolve Gmail SMTP via Google DNS to bypass network redirect to 10.x.x.x */
@@ -76,18 +108,38 @@ async function createTransporter() {
   });
 }
 
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function main() {
   const dryRun = process.argv.includes('--dry-run');
   const subject = process.env.SUBJECT || 'Hello';
   const text = process.env.BODY || 'This message was sent from the SMTP sender script.';
   const limit = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : null;
+  const delayMs = getDelayMs();
 
-  const recipients = loadEmails();
+  let recipients = loadEmails();
+  const results = loadResults();
+  // Skip addresses we already sent to (so restart doesn't re-send)
+  const alreadySent = recipients.filter((e) => results[e]?.status === 'sent');
+  recipients = recipients.filter((e) => results[e]?.status !== 'sent');
   if (limit && limit > 0) recipients.splice(limit);
-  console.log(`Loaded ${recipients.length} recipient(s) from emails_merged.txt`);
+  const totalInList = recipients.length + alreadySent.length;
+
+  console.log(`Loaded ${totalInList} recipient(s) from emails_merged.txt`);
+  if (alreadySent.length > 0) {
+    console.log(`Skipping ${alreadySent.length} already sent (from ${RESULTS_FILE})`);
+  }
+  console.log(`To send this run: ${recipients.length} (delay ${delayMs}ms between emails)`);
 
   if (dryRun) {
-    console.log('Dry run – not sending. Recipients (first 10):', recipients.slice(0, 10));
+    console.log('Dry run – not sending. To send (first 10):', recipients.slice(0, 10));
+    return;
+  }
+
+  if (recipients.length === 0) {
+    console.log('Nothing to send.');
     return;
   }
 
@@ -95,7 +147,9 @@ async function main() {
   let sent = 0;
   let failed = 0;
 
-  for (const to of recipients) {
+  for (let i = 0; i < recipients.length; i++) {
+    const to = recipients[i];
+    if (i > 0 && delayMs > 0) await sleep(delayMs);
     try {
       await transporter.sendMail({
         from: FROM_EMAIL,
@@ -104,14 +158,16 @@ async function main() {
         text,
       });
       sent++;
+      saveResult(results, to, 'sent');
       if (sent % 50 === 0) console.log(`Sent ${sent}/${recipients.length}...`);
     } catch (err) {
       failed++;
+      saveResult(results, to, 'failed', err.message);
       console.error(`Failed to send to ${to}:`, err.message);
     }
   }
 
-  console.log(`Done. Sent: ${sent}, Failed: ${failed}`);
+  console.log(`Done. Sent: ${sent}, Failed: ${failed}. Results saved to ${RESULTS_FILE}`);
 }
 
 main().catch((err) => {
