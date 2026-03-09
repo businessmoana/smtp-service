@@ -46,6 +46,16 @@ function getRateLimitWaitMinutes() {
   return 0;
 }
 
+/** When daily 550 limit is hit, wait this many hours then retry once (0 = don't wait, just stop). */
+function getDailyLimitWaitHours() {
+  const env = process.env.DAILY_LIMIT_WAIT_HOURS;
+  if (env != null && env !== '') {
+    const n = parseInt(env, 10);
+    if (!Number.isNaN(n) && n >= 0) return n;
+  }
+  return 0;
+}
+
 // Load recipients from file (comma-separated on one or more lines)
 function loadEmails() {
   const raw = readFileSync(EMAILS_FILE, 'utf8');
@@ -129,6 +139,7 @@ async function main() {
   const limit = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : null;
   const delayMs = getDelayMs();
   const rateLimitWaitMin = getRateLimitWaitMinutes();
+  const dailyLimitWaitHours = getDailyLimitWaitHours();
 
   let recipients = loadEmails();
   const results = loadResults();
@@ -175,8 +186,33 @@ async function main() {
       failed++;
       saveResult(results, to, 'failed', err.message);
       console.error(`Failed to send to ${to}:`, err.message);
-      const is454 = String(err.message).includes('454') || String(err.message).includes('Too many login attempts');
-      if (is454 && rateLimitWaitMin > 0) {
+      const msg = String(err.message);
+      const is454 = msg.includes('454') || msg.includes('Too many login attempts');
+      const is550DailyLimit = msg.includes('550') && msg.includes('Daily user sending limit exceeded');
+
+      // 550 5.4.5 = daily send limit; cannot be fixed until quota resets
+      if (is550DailyLimit && dailyLimitWaitHours > 0) {
+        console.error('\nGmail daily sending limit reached (550 5.4.5).');
+        console.error(`Waiting ${dailyLimitWaitHours} hour(s), then retrying this recipient once...`);
+        await sleep(dailyLimitWaitHours * 60 * 60 * 1000);
+        try {
+          const tDaily = await createTransporter();
+          await tDaily.sendMail({ from: FROM_EMAIL, to, subject, text });
+          sent++;
+          failed--;
+          saveResult(results, to, 'sent');
+          console.log(`Retry after daily limit reset succeeded for ${to}`);
+        } catch (retryDailyErr) {
+          console.error(`Retry after daily wait failed for ${to}:`, retryDailyErr.message);
+          console.error('Daily limit may still apply. Script will stop now; run again after 24 hours or switch sender.');
+          break;
+        }
+      } else if (is550DailyLimit) {
+        console.error('\nGmail daily sending limit reached (550 5.4.5).');
+        console.error('You must wait ~24 hours or switch to another sender (different Gmail account or SMTP provider).');
+        console.error('Script will stop now. Already-sent addresses are recorded in send_results.json.');
+        break;
+      } else if (is454 && rateLimitWaitMin > 0) {
         console.error(`\nGmail rate limit (454). Waiting ${rateLimitWaitMin} minutes, then retrying...`);
         await sleep(rateLimitWaitMin * 60 * 1000);
         try {
