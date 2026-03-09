@@ -1,0 +1,15 @@
+{
+  "name": "smtp-sender",
+  "version": "1.0.0",
+  "description": "Send emails via SMTP using addresses from emails_merged.txt",
+  "main": "send.js",
+  "type": "module",
+  "scripts": {
+    "send": "node send.js",
+    "send:dry": "node send.js --dry-run"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "nodemailer": "^6.9.7"
+  }
+}
