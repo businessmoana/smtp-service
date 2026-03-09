@@ -26,14 +26,24 @@ const EMAILS_FILE = join(__dirname, 'emails_merged.txt');
 const RESULTS_FILE = join(__dirname, 'send_results.json');
 const GMAIL_SMTP_HOST = 'smtp.gmail.com';
 
-/** Delay between sends (ms) to reduce Gmail "too many login attempts" rate limit. */
+/** Delay between sends (ms). Default 10s to avoid Gmail 454 "too many login attempts". */
 function getDelayMs() {
   const env = process.env.DELAY_MS;
   if (env != null && env !== '') {
     const n = parseInt(env, 10);
     if (!Number.isNaN(n) && n >= 0) return n;
   }
-  return 2000;
+  return 10000;
+}
+
+/** When 454 is hit, wait this many minutes then retry (0 = don't wait, just stop). */
+function getRateLimitWaitMinutes() {
+  const env = process.env.RATE_LIMIT_WAIT_MINUTES;
+  if (env != null && env !== '') {
+    const n = parseInt(env, 10);
+    if (!Number.isNaN(n) && n >= 0) return n;
+  }
+  return 0;
 }
 
 // Load recipients from file (comma-separated on one or more lines)
@@ -118,6 +128,7 @@ async function main() {
   const text = process.env.BODY || 'This message was sent from the SMTP sender script.';
   const limit = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : null;
   const delayMs = getDelayMs();
+  const rateLimitWaitMin = getRateLimitWaitMinutes();
 
   let recipients = loadEmails();
   const results = loadResults();
@@ -164,6 +175,27 @@ async function main() {
       failed++;
       saveResult(results, to, 'failed', err.message);
       console.error(`Failed to send to ${to}:`, err.message);
+      const is454 = String(err.message).includes('454') || String(err.message).includes('Too many login attempts');
+      if (is454 && rateLimitWaitMin > 0) {
+        console.error(`\nGmail rate limit (454). Waiting ${rateLimitWaitMin} minutes, then retrying...`);
+        await sleep(rateLimitWaitMin * 60 * 1000);
+        try {
+          const t = await createTransporter();
+          await t.sendMail({ from: FROM_EMAIL, to, subject, text });
+          sent++;
+          failed--;
+          saveResult(results, to, 'sent');
+          console.log(`Retry sent to ${to}`);
+        } catch (retryErr) {
+          console.error(`Retry failed for ${to}:`, retryErr.message);
+          console.error('Wait 30–60 minutes, then run again. Already-sent addresses will be skipped.');
+          break;
+        }
+      } else if (is454) {
+        console.error('\nGmail rate limit (454). Stop sending now.');
+        console.error('Wait 30–60 minutes, then run again. Or set RATE_LIMIT_WAIT_MINUTES=30 in .env to auto-wait.');
+        break;
+      }
     }
   }
 
