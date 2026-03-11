@@ -1,13 +1,15 @@
 /**
  * Send emails via Gmail SMTP using addresses from emails_merged.txt
- * From: businessmoana118@gmail.com
+ *
+ * Single account: set GMAIL_APP_PASSWORD (and optionally FROM_EMAIL).
+ * Multiple accounts: set ACCOUNT_1_EMAIL, ACCOUNT_1_APP_PASSWORD, ACCOUNT_2_EMAIL, ACCOUNT_2_APP_PASSWORD, ...
+ *   Sends rotate: 1st → account 1, 2nd → account 2, 3rd → account 1, etc.
+ *   Set PER_ACCOUNT_LIMIT=200 to cap sends per account per run.
  *
  * Setup:
  * 1. Copy .env.example to .env
- * 2. Add your Gmail App Password to .env (not your normal password)
- *    Create one at: https://myaccount.google.com/apppasswords
- * 3. Run: npm run send
- *    Or dry run (no send): npm run send:dry
+ * 2. Add Gmail App Password(s) – create at https://myaccount.google.com/apppasswords
+ * 3. Run: npm run send   or dry run: npm run send:dry
  */
 
 import 'dotenv/config';
@@ -21,7 +23,7 @@ import { dirname, join } from 'path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const resolve4 = promisify(dns.resolve4);
 
-const FROM_EMAIL = 'businessmoana118@gmail.com';
+const DEFAULT_FROM_EMAIL = 'businessmoana118@gmail.com';
 const EMAILS_FILE = join(__dirname, 'emails_merged.txt');
 const RESULTS_FILE = join(__dirname, 'send_results.json');
 const GMAIL_SMTP_HOST = 'smtp.gmail.com';
@@ -54,6 +56,33 @@ function getDailyLimitWaitHours() {
     if (!Number.isNaN(n) && n >= 0) return n;
   }
   return 0;
+}
+
+/** Max emails to send per account in this run (0 = no limit). */
+function getPerAccountLimit() {
+  const env = process.env.PER_ACCOUNT_LIMIT;
+  if (env != null && env !== '') {
+    const n = parseInt(env, 10);
+    if (!Number.isNaN(n) && n >= 0) return n;
+  }
+  return 0;
+}
+
+/** Load Gmail accounts: [{ email, password }, ...]. Supports ACCOUNT_1_EMAIL, ACCOUNT_1_APP_PASSWORD, ACCOUNT_2_*, etc. */
+function loadAccounts() {
+  const accounts = [];
+  for (let n = 1; n <= 10; n++) {
+    const email = process.env[`ACCOUNT_${n}_EMAIL`]?.trim();
+    const password = process.env[`ACCOUNT_${n}_APP_PASSWORD`]?.trim?.() ?? process.env[`ACCOUNT_${n}_APP_PASSWORD`];
+    if (email && password) accounts.push({ email, password });
+  }
+  if (accounts.length > 0) return accounts;
+  const singlePass = process.env.GMAIL_APP_PASSWORD?.trim?.() ?? process.env.GMAIL_APP_PASSWORD;
+  const singleEmail = (process.env.FROM_EMAIL || DEFAULT_FROM_EMAIL).trim();
+  if (singlePass) return [{ email: singleEmail, password: singlePass }];
+  throw new Error(
+    'No accounts configured. Set GMAIL_APP_PASSWORD (and optionally FROM_EMAIL) or ACCOUNT_1_EMAIL + ACCOUNT_1_APP_PASSWORD, etc.'
+  );
 }
 
 // Load recipients from file (comma-separated on one or more lines)
@@ -99,18 +128,12 @@ async function resolveGmailHost() {
   }
 }
 
-async function createTransporter() {
-  const password = process.env.GMAIL_APP_PASSWORD;
-  if (!password) {
-    throw new Error(
-      'Missing GMAIL_APP_PASSWORD in .env. Create an App Password at https://myaccount.google.com/apppasswords'
-    );
-  }
+async function createTransporter(user, password) {
   const useSSL = process.env.SMTP_SSL !== '0';
   const port = useSSL ? 465 : 587;
 
   let host = GMAIL_SMTP_HOST;
-  const useDirectIP = process.env.SMTP_BYPASS_DNS !== '0'; // default on: resolve via 8.8.8.8 to avoid 10.x redirect
+  const useDirectIP = process.env.SMTP_BYPASS_DNS !== '0';
   if (useDirectIP) {
     host = await resolveGmailHost();
     console.log(`Using Gmail IP (bypass DNS): ${host}:${port}`);
@@ -120,10 +143,7 @@ async function createTransporter() {
     host,
     port,
     secure: useSSL,
-    auth: {
-      user: FROM_EMAIL,
-      pass: password,
-    },
+    auth: { user, pass: password },
     tls: host !== GMAIL_SMTP_HOST ? { servername: GMAIL_SMTP_HOST } : undefined,
   });
 }
@@ -140,10 +160,36 @@ async function main() {
   const delayMs = getDelayMs();
   const rateLimitWaitMin = getRateLimitWaitMinutes();
   const dailyLimitWaitHours = getDailyLimitWaitHours();
+  const perAccountLimit = getPerAccountLimit();
+
+  const accounts = loadAccounts();
+  const nAccounts = accounts.length;
+  console.log(`Using ${nAccounts} Gmail account(s): ${accounts.map((a) => a.email).join(', ')}`);
+  if (perAccountLimit > 0) console.log(`Per-account limit: ${perAccountLimit} sends per account this run`);
+
+  const transporterCache = [];
+  const getTransporter = async (accountIndex) => {
+    if (!transporterCache[accountIndex]) {
+      const { email, password } = accounts[accountIndex];
+      transporterCache[accountIndex] = await createTransporter(email, password);
+    }
+    return transporterCache[accountIndex];
+  };
+
+  const sentCounts = new Array(nAccounts).fill(0);
+  let lastUsedAccountIndex = -1;
+
+  /** Round-robin: next account index that is under per-account limit. Returns -1 if all at limit. */
+  function getNextAccountIndex() {
+    for (let k = 1; k <= nAccounts; k++) {
+      const j = (lastUsedAccountIndex + k) % nAccounts;
+      if (perAccountLimit === 0 || sentCounts[j] < perAccountLimit) return j;
+    }
+    return -1;
+  }
 
   let recipients = loadEmails();
   const results = loadResults();
-  // Skip addresses we already sent to (so restart doesn't re-send)
   const alreadySent = recipients.filter((e) => results[e]?.status === 'sent');
   recipients = recipients.filter((e) => results[e]?.status !== 'sent');
   if (limit && limit > 0) recipients.splice(limit);
@@ -165,41 +211,51 @@ async function main() {
     return;
   }
 
-  const transporter = await createTransporter();
   let sent = 0;
   let failed = 0;
 
   for (let i = 0; i < recipients.length; i++) {
     const to = recipients[i];
+    const accountIndex = getNextAccountIndex();
+    if (accountIndex === -1) {
+      console.log(`All accounts reached per-account limit (${perAccountLimit}). Stopping.`);
+      break;
+    }
+    lastUsedAccountIndex = accountIndex;
+    const fromEmail = accounts[accountIndex].email;
+
     if (i > 0 && delayMs > 0) await sleep(delayMs);
+
     try {
+      const transporter = await getTransporter(accountIndex);
       await transporter.sendMail({
-        from: FROM_EMAIL,
+        from: fromEmail,
         to,
         subject,
         text,
       });
       sent++;
+      sentCounts[accountIndex]++;
       saveResult(results, to, 'sent');
-      if (sent % 50 === 0) console.log(`Sent ${sent}/${recipients.length}...`);
+      if (sent % 50 === 0) console.log(`Sent ${sent}/${recipients.length}... (${fromEmail})`);
     } catch (err) {
       failed++;
       saveResult(results, to, 'failed', err.message);
-      console.error(`Failed to send to ${to}:`, err.message);
+      console.error(`Failed to send to ${to} (from ${fromEmail}):`, err.message);
       const msg = String(err.message);
       const is454 = msg.includes('454') || msg.includes('Too many login attempts');
       const is550DailyLimit = msg.includes('550') && msg.includes('Daily user sending limit exceeded');
 
-      // 550 5.4.5 = daily send limit; cannot be fixed until quota resets
       if (is550DailyLimit && dailyLimitWaitHours > 0) {
         console.error('\nGmail daily sending limit reached (550 5.4.5).');
         console.error(`Waiting ${dailyLimitWaitHours} hour(s), then retrying this recipient once...`);
         await sleep(dailyLimitWaitHours * 60 * 60 * 1000);
         try {
-          const tDaily = await createTransporter();
-          await tDaily.sendMail({ from: FROM_EMAIL, to, subject, text });
+          const tDaily = await getTransporter(accountIndex);
+          await tDaily.sendMail({ from: fromEmail, to, subject, text });
           sent++;
           failed--;
+          sentCounts[accountIndex]++;
           saveResult(results, to, 'sent');
           console.log(`Retry after daily limit reset succeeded for ${to}`);
         } catch (retryDailyErr) {
@@ -216,10 +272,11 @@ async function main() {
         console.error(`\nGmail rate limit (454). Waiting ${rateLimitWaitMin} minutes, then retrying...`);
         await sleep(rateLimitWaitMin * 60 * 1000);
         try {
-          const t = await createTransporter();
-          await t.sendMail({ from: FROM_EMAIL, to, subject, text });
+          const t = await getTransporter(accountIndex);
+          await t.sendMail({ from: fromEmail, to, subject, text });
           sent++;
           failed--;
+          sentCounts[accountIndex]++;
           saveResult(results, to, 'sent');
           console.log(`Retry sent to ${to}`);
         } catch (retryErr) {
@@ -235,6 +292,9 @@ async function main() {
     }
   }
 
+  if (nAccounts > 1 && perAccountLimit > 0) {
+    console.log(`Per-account sends: ${accounts.map((a, j) => `${a.email}=${sentCounts[j]}`).join(', ')}`);
+  }
   console.log(`Done. Sent: ${sent}, Failed: ${failed}. Results saved to ${RESULTS_FILE}`);
 }
 
