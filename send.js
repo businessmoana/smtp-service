@@ -178,14 +178,36 @@ async function main() {
 
   const sentCounts = new Array(nAccounts).fill(0);
   let lastUsedAccountIndex = -1;
+  const disabledUntil = new Array(nAccounts).fill(0); // ms epoch; 0 = enabled
+  const disabledReason = new Array(nAccounts).fill('');
 
-  /** Round-robin: next account index that is under per-account limit. Returns -1 if all at limit. */
+  function isAccountAvailable(j) {
+    const now = Date.now();
+    if (disabledUntil[j] && disabledUntil[j] > now) return false;
+    if (disabledUntil[j] && disabledUntil[j] <= now) {
+      disabledUntil[j] = 0;
+      disabledReason[j] = '';
+    }
+    if (perAccountLimit > 0 && sentCounts[j] >= perAccountLimit) return false;
+    return true;
+  }
+
+  /** Round-robin: next account index that is available. Returns -1 if none available. */
   function getNextAccountIndex() {
     for (let k = 1; k <= nAccounts; k++) {
       const j = (lastUsedAccountIndex + k) % nAccounts;
-      if (perAccountLimit === 0 || sentCounts[j] < perAccountLimit) return j;
+      if (isAccountAvailable(j)) return j;
     }
     return -1;
+  }
+
+  function getEarliestReenableMs() {
+    const now = Date.now();
+    let earliest = Infinity;
+    for (let j = 0; j < nAccounts; j++) {
+      if (disabledUntil[j] && disabledUntil[j] > now) earliest = Math.min(earliest, disabledUntil[j]);
+    }
+    return earliest === Infinity ? -1 : earliest;
   }
 
   let recipients = loadEmails();
@@ -216,9 +238,18 @@ async function main() {
 
   for (let i = 0; i < recipients.length; i++) {
     const to = recipients[i];
-    const accountIndex = getNextAccountIndex();
+    let accountIndex = getNextAccountIndex();
     if (accountIndex === -1) {
-      console.log(`All accounts reached per-account limit (${perAccountLimit}). Stopping.`);
+      const earliest = getEarliestReenableMs();
+      if (earliest !== -1) {
+        const waitMs = Math.max(0, earliest - Date.now());
+        console.log(`All accounts temporarily blocked. Waiting ${Math.ceil(waitMs / 1000)}s then continuing...`);
+        if (waitMs > 0) await sleep(waitMs);
+        accountIndex = getNextAccountIndex();
+      }
+    }
+    if (accountIndex === -1) {
+      console.log('No available accounts left (daily limit / per-account limit). Stopping.');
       break;
     }
     lastUsedAccountIndex = accountIndex;
@@ -246,44 +277,18 @@ async function main() {
       const is454 = msg.includes('454') || msg.includes('Too many login attempts');
       const is550DailyLimit = msg.includes('550') && msg.includes('Daily user sending limit exceeded');
 
-      if (is550DailyLimit && dailyLimitWaitHours > 0) {
+      if (is550DailyLimit) {
         console.error('\nGmail daily sending limit reached (550 5.4.5).');
-        console.error(`Waiting ${dailyLimitWaitHours} hour(s), then retrying this recipient once...`);
-        await sleep(dailyLimitWaitHours * 60 * 60 * 1000);
-        try {
-          const tDaily = await getTransporter(accountIndex);
-          await tDaily.sendMail({ from: fromEmail, to, subject, text });
-          sent++;
-          failed--;
-          sentCounts[accountIndex]++;
-          saveResult(results, to, 'sent');
-          console.log(`Retry after daily limit reset succeeded for ${to}`);
-        } catch (retryDailyErr) {
-          console.error(`Retry after daily wait failed for ${to}:`, retryDailyErr.message);
-          console.error('Daily limit may still apply. Script will stop now; run again after 24 hours or switch sender.');
-          break;
-        }
-      } else if (is550DailyLimit) {
-        console.error('\nGmail daily sending limit reached (550 5.4.5).');
-        console.error('You must wait ~24 hours or switch to another sender (different Gmail account or SMTP provider).');
-        console.error('Script will stop now. Already-sent addresses are recorded in send_results.json.');
-        break;
+        console.error(`Disabling account ${fromEmail} and continuing with other account(s).`);
+        const waitHours = dailyLimitWaitHours > 0 ? dailyLimitWaitHours : 24;
+        disabledUntil[accountIndex] = Date.now() + waitHours * 60 * 60 * 1000;
+        disabledReason[accountIndex] = 'daily_limit';
+        continue;
       } else if (is454 && rateLimitWaitMin > 0) {
-        console.error(`\nGmail rate limit (454). Waiting ${rateLimitWaitMin} minutes, then retrying...`);
-        await sleep(rateLimitWaitMin * 60 * 1000);
-        try {
-          const t = await getTransporter(accountIndex);
-          await t.sendMail({ from: fromEmail, to, subject, text });
-          sent++;
-          failed--;
-          sentCounts[accountIndex]++;
-          saveResult(results, to, 'sent');
-          console.log(`Retry sent to ${to}`);
-        } catch (retryErr) {
-          console.error(`Retry failed for ${to}:`, retryErr.message);
-          console.error('Wait 30–60 minutes, then run again. Already-sent addresses will be skipped.');
-          break;
-        }
+        console.error(`\nGmail rate limit (454) for ${fromEmail}. Disabling this account for ${rateLimitWaitMin} minute(s) and continuing...`);
+        disabledUntil[accountIndex] = Date.now() + rateLimitWaitMin * 60 * 1000;
+        disabledReason[accountIndex] = 'rate_limit';
+        continue;
       } else if (is454) {
         console.error('\nGmail rate limit (454). Stop sending now.');
         console.error('Wait 30–60 minutes, then run again. Or set RATE_LIMIT_WAIT_MINUTES=30 in .env to auto-wait.');
